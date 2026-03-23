@@ -477,21 +477,46 @@ class PynguinRunner:
     # ── Stage 5: Run pytest on test files ────────────────────────────────
 
     @staticmethod
-    def _load_existing_test_map(output: Path) -> Dict[str, str]:
-        """Read ``.existing_test_map`` and return ``{filename: module_or_UNLINKED}``."""
+    def _load_existing_test_map(output: Path) -> Dict[str, dict]:
+        """Read ``.existing_test_map`` and return per-file metadata.
+
+        Returns ``{filename: {"module": str, "relevant": [str], "skipped": [str]}}``.
+        """
         map_file = output / ".existing_test_map"
         if not map_file.is_file():
             return {}
-        mapping: Dict[str, str] = {}
+
+        mapping: Dict[str, dict] = {}
         for line in map_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if "=" in line:
-                fname, mod = line.split("=", 1)
-                mapping[fname] = mod
+            if "=" not in line:
+                continue
+
+            fname, rest = line.split("=", 1)
+            parts = rest.split("|")
+            module = parts[0]
+            relevant: List[str] = []
+            skipped: List[str] = []
+            for part in parts[1:]:
+                if part.startswith("relevant=") and part[9:]:
+                    relevant = part[9:].split(",")
+                elif part.startswith("skipped=") and part[8:]:
+                    skipped = part[8:].split(",")
+
+            mapping[fname] = {
+                "module": module,
+                "relevant": relevant,
+                "skipped": skipped,
+            }
+
         return mapping
 
     def run_pytest(self) -> bool:
         """Run pytest in two rounds: pre-existing tests, then generated tests.
+
+        For pre-existing tests linked to a source module, only the test
+        functions that actually call module symbols are executed (via
+        ``pytest -k``).  Irrelevant functions are reported and skipped.
 
         Returns True only if both rounds pass (or a round has no files).
         """
@@ -519,37 +544,56 @@ class PynguinRunner:
 
         # ── Round 1: pre-existing project tests ──
         if existing_files:
-            linked = [f for f in existing_files if test_map.get(f.name) not in (None, "UNLINKED")]
-            unlinked = [f for f in existing_files if f not in linked]
-
             print(f"\n{'=' * 60}")
             print(f"  ROUND 1: PRE-EXISTING PROJECT TESTS "
                   f"({len(existing_files)} file(s))")
             print(f"{'=' * 60}")
 
-            if linked:
-                print(f"\n  Linked to source modules:")
-                for tf in linked:
-                    mod = test_map[tf.name]
-                    print(f"    {tf.name}  ->  {mod}")
+            for tf in existing_files:
+                info = test_map.get(tf.name, {})
+                module = info.get("module", "UNLINKED")
+                relevant = info.get("relevant", [])
+                skipped = info.get("skipped", [])
 
-            if unlinked:
-                print(f"\n  Unlinked (no matching source module):")
-                for tf in unlinked:
-                    print(f"    {tf.name}")
+                print(f"\n  {'-' * 56}")
+                if module == "UNLINKED":
+                    print(f"  {tf.name}")
+                    print(f"    Source module : (unlinked)")
+                    print(f"    Running       : ALL test functions")
+                    cmd = [str(self._python), "-m", "pytest", str(tf),
+                           "-v", "--tb=long", "-rA"]
+                else:
+                    print(f"  {tf.name}  ->  {module}")
+                    total = len(relevant) + len(skipped)
+                    print(f"    Functions     : {total} total, "
+                          f"{len(relevant)} relevant, {len(skipped)} skipped")
 
-            print()
-            file_args = [str(f) for f in existing_files]
-            cmd = [str(self._python), "-m", "pytest"] + file_args + [
-                "-v", "--tb=long", "-rA",
-            ]
-            result = run(cmd, env=env, check=False)
-            if result.returncode == 0:
-                print("[pytest] All pre-existing tests PASSED.")
-            else:
-                print(f"[pytest] Some pre-existing tests FAILED "
-                      f"(exit code {result.returncode}).")
-                all_passed = False
+                    if relevant:
+                        print(f"    RUN:")
+                        for fn in relevant:
+                            print(f"      + {fn}")
+                    if skipped:
+                        print(f"    SKIP (not related to {module}):")
+                        for fn in skipped:
+                            print(f"      - {fn}")
+
+                    if relevant:
+                        k_expr = " or ".join(relevant)
+                        cmd = [str(self._python), "-m", "pytest", str(tf),
+                               "-k", k_expr, "-v", "--tb=long", "-rA"]
+                    elif not relevant and not skipped:
+                        cmd = [str(self._python), "-m", "pytest", str(tf),
+                               "-v", "--tb=long", "-rA"]
+                    else:
+                        print(f"    -> No relevant functions found; skipping file.")
+                        continue
+
+                result = run(cmd, env=env, check=False)
+                if result.returncode == 0:
+                    print(f"  [PASSED] {tf.name}")
+                else:
+                    print(f"  [FAILED] {tf.name} (exit code {result.returncode})")
+                    all_passed = False
         else:
             print("\n[pytest] No pre-existing tests found in the project.")
 
@@ -599,6 +643,70 @@ class PynguinRunner:
                     modules.append(node.module)
         return modules
 
+    @staticmethod
+    def _get_module_symbols(module_path: Path) -> set:
+        """Return the set of top-level function and class names in a source module."""
+        try:
+            source = module_path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            return set()
+
+        symbols: set = set()
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                symbols.add(node.name)
+        return symbols
+
+    @staticmethod
+    def _filter_relevant_test_functions(
+        test_file: Path,
+        target_symbols: set,
+    ) -> Tuple[List[str], List[str]]:
+        """Split test functions into relevant vs irrelevant for a source module.
+
+        A test function is *relevant* if its body contains a call to any
+        name in *target_symbols* (directly or via attribute access like
+        ``module.func()``).
+
+        Returns ``(relevant_names, skipped_names)``.
+        """
+        try:
+            source = test_file.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            return [], []
+
+        relevant: List[str] = []
+        skipped: List[str] = []
+
+        for node in ast.iter_child_nodes(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if not node.name.startswith("test_"):
+                continue
+
+            found = False
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call):
+                    continue
+                func = child.func
+                name = None
+                if isinstance(func, ast.Name):
+                    name = func.id
+                elif isinstance(func, ast.Attribute):
+                    name = func.attr
+                if name and name in target_symbols:
+                    found = True
+                    break
+
+            if found:
+                relevant.append(node.name)
+            else:
+                skipped.append(node.name)
+
+        return relevant, skipped
+
     def _match_test_to_module(
         self,
         test_file: Path,
@@ -621,7 +729,6 @@ class PynguinRunner:
 
         # ── Strategy 2: name convention ──
         stem = test_file.stem
-        # test_scoring -> scoring,  scoring_test -> scoring
         name = re.sub(r"^test_", "", stem)
         name = re.sub(r"_test$", "", name)
         name_parts = name.lower().split("_")
@@ -723,13 +830,23 @@ class PynguinRunner:
 
         return stash, stashed_matched, stashed_unmatched
 
+    def _resolve_module_path(self, module_name: str) -> Optional[Path]:
+        """Turn a dotted module name into a file path relative to the project."""
+        project = Path(self.project_path).resolve()
+        rel = Path(*module_name.split(".")).with_suffix(".py")
+        full = project / rel
+        return full if full.is_file() else None
+
     def _restore_existing_tests(
         self,
         stash_info: Optional[Tuple[Path, Dict[str, List[str]], List[str]]],
     ) -> None:
         """Copy stashed tests into the output dir with an ``existing_`` prefix.
 
-        Also writes a small mapping file so ``run_pytest`` can report linkage.
+        For linked files, performs function-level filtering: only test
+        functions that call symbols from the matched source module are
+        marked as relevant.  Writes a mapping file that ``run_pytest``
+        uses to run only the relevant functions.
         """
         if stash_info is None:
             return
@@ -745,20 +862,43 @@ class PynguinRunner:
         mapping_lines: List[str] = []
 
         for mod, names in sorted(matched_map.items()):
+            mod_path = self._resolve_module_path(mod)
+            target_symbols = self._get_module_symbols(mod_path) if mod_path else set()
+
             for name in names:
                 src = stash / name
                 dest = output / f"existing_{name}"
-                if src.is_file() and not dest.exists():
-                    shutil.copy2(src, dest)
-                    mapping_lines.append(f"existing_{name}={mod}")
-                    restored += 1
+                if not src.is_file() or dest.exists():
+                    continue
+                shutil.copy2(src, dest)
+                restored += 1
+
+                if target_symbols:
+                    relevant, skipped = self._filter_relevant_test_functions(
+                        dest, target_symbols,
+                    )
+                    funcs_str = ",".join(relevant) if relevant else ""
+                    skipped_str = ",".join(skipped) if skipped else ""
+                    mapping_lines.append(
+                        f"existing_{name}={mod}|relevant={funcs_str}|skipped={skipped_str}"
+                    )
+
+                    if relevant or skipped:
+                        print(f"  [filter] {name} -> {mod}")
+                        print(f"           {len(relevant)} relevant, "
+                              f"{len(skipped)} skipped")
+                        if skipped:
+                            for s in skipped:
+                                print(f"           SKIP  {s}")
+                else:
+                    mapping_lines.append(f"existing_{name}={mod}|relevant=|skipped=")
 
         for name in unmatched_names:
             src = stash / name
             dest = output / f"existing_{name}"
             if src.is_file() and not dest.exists():
                 shutil.copy2(src, dest)
-                mapping_lines.append(f"existing_{name}=UNLINKED")
+                mapping_lines.append(f"existing_{name}=UNLINKED|relevant=|skipped=")
                 restored += 1
 
         if mapping_lines:
