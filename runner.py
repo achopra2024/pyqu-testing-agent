@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import glob
 import os
+import re
 import shutil
 import tempfile
 import venv
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .config import (
     DEFAULT_ALGORITHM,
@@ -472,33 +474,303 @@ class PynguinRunner:
 
         return run_all_comparisons(output, self._python, env)
 
-    # ── Stage 5: Run pytest on generated tests ───────────────────────────
+    # ── Stage 5: Run pytest on test files ────────────────────────────────
+
+    @staticmethod
+    def _load_existing_test_map(output: Path) -> Dict[str, str]:
+        """Read ``.existing_test_map`` and return ``{filename: module_or_UNLINKED}``."""
+        map_file = output / ".existing_test_map"
+        if not map_file.is_file():
+            return {}
+        mapping: Dict[str, str] = {}
+        for line in map_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if "=" in line:
+                fname, mod = line.split("=", 1)
+                mapping[fname] = mod
+        return mapping
 
     def run_pytest(self) -> bool:
-        """Run pytest against the generated test files."""
+        """Run pytest in two rounds: pre-existing tests, then generated tests.
+
+        Returns True only if both rounds pass (or a round has no files).
+        """
         output = Path(self.output_dir).resolve()
-        if not output.exists() or not any(output.glob("test_*.py")):
-            print("[pytest] No generated test files found -- skipping pytest.")
+        if not output.exists():
+            print("[pytest] No test files found -- skipping pytest.")
             return False
 
-        test_files = sorted(output.glob("test_*.py"))
-        print(f"\n[pytest] Running pytest on {len(test_files)} generated test file(s):")
-        for tf in test_files:
-            print(f"         {tf.name}")
+        existing_files = sorted(output.glob("existing_test_*.py"))
+        generated_files = sorted(
+            f for f in output.glob("test_*.py")
+            if not f.name.startswith("existing_")
+        )
+
+        if not existing_files and not generated_files:
+            print("[pytest] No test files found -- skipping pytest.")
+            return False
 
         project = Path(self.project_path).resolve()
         env = self._build_pynguin_env()
         env["PYTHONPATH"] = str(project) + os.pathsep + env.get("PYTHONPATH", "")
 
-        cmd = [str(self._python), "-m", "pytest", str(output), "-v", "--tb=long", "-rA"]
-        result = run(cmd, env=env, check=False)
+        test_map = self._load_existing_test_map(output)
+        all_passed = True
 
-        if result.returncode == 0:
-            print("[pytest] All generated tests PASSED.")
-            return True
+        # ── Round 1: pre-existing project tests ──
+        if existing_files:
+            linked = [f for f in existing_files if test_map.get(f.name) not in (None, "UNLINKED")]
+            unlinked = [f for f in existing_files if f not in linked]
 
-        print(f"[pytest] Some tests failed (exit code {result.returncode}).")
-        return False
+            print(f"\n{'=' * 60}")
+            print(f"  ROUND 1: PRE-EXISTING PROJECT TESTS "
+                  f"({len(existing_files)} file(s))")
+            print(f"{'=' * 60}")
+
+            if linked:
+                print(f"\n  Linked to source modules:")
+                for tf in linked:
+                    mod = test_map[tf.name]
+                    print(f"    {tf.name}  ->  {mod}")
+
+            if unlinked:
+                print(f"\n  Unlinked (no matching source module):")
+                for tf in unlinked:
+                    print(f"    {tf.name}")
+
+            print()
+            file_args = [str(f) for f in existing_files]
+            cmd = [str(self._python), "-m", "pytest"] + file_args + [
+                "-v", "--tb=long", "-rA",
+            ]
+            result = run(cmd, env=env, check=False)
+            if result.returncode == 0:
+                print("[pytest] All pre-existing tests PASSED.")
+            else:
+                print(f"[pytest] Some pre-existing tests FAILED "
+                      f"(exit code {result.returncode}).")
+                all_passed = False
+        else:
+            print("\n[pytest] No pre-existing tests found in the project.")
+
+        # ── Round 2: Pynguin-generated tests ──
+        if generated_files:
+            print(f"\n{'=' * 60}")
+            print(f"  ROUND 2: PYNGUIN-GENERATED TESTS "
+                  f"({len(generated_files)} file(s))")
+            print(f"{'=' * 60}")
+            for tf in generated_files:
+                print(f"  {tf.name}")
+
+            file_args = [str(f) for f in generated_files]
+            cmd = [str(self._python), "-m", "pytest"] + file_args + [
+                "-v", "--tb=long", "-rA",
+            ]
+            result = run(cmd, env=env, check=False)
+            if result.returncode == 0:
+                print("[pytest] All generated tests PASSED.")
+            else:
+                print(f"[pytest] Some generated tests FAILED "
+                      f"(exit code {result.returncode}).")
+                all_passed = False
+        else:
+            print("\n[pytest] No Pynguin-generated tests produced.")
+
+        return all_passed
+
+    # ── Discover & match existing project tests ─────────────────────────
+
+    @staticmethod
+    def _extract_imports(test_file: Path) -> List[str]:
+        """Return all imported module names from a Python test file."""
+        try:
+            source = test_file.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            return []
+
+        modules: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    modules.append(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    modules.append(node.module)
+        return modules
+
+    def _match_test_to_module(
+        self,
+        test_file: Path,
+        source_modules: List[str],
+    ) -> Optional[str]:
+        """Try to link a test file to a source module.
+
+        Strategy (in priority order):
+        1. **Import scan** — parse the test file's imports and see if any
+           match a known source module (or a parent of one).
+        2. **Name convention** — strip ``test_`` / ``_test`` from the
+           filename and check if any source module's leaf name matches.
+        """
+        # ── Strategy 1: import scanning ──
+        imported = self._extract_imports(test_file)
+        for imp in imported:
+            for mod in source_modules:
+                if mod == imp or mod.startswith(imp + ".") or imp.startswith(mod + "."):
+                    return mod
+
+        # ── Strategy 2: name convention ──
+        stem = test_file.stem
+        # test_scoring -> scoring,  scoring_test -> scoring
+        name = re.sub(r"^test_", "", stem)
+        name = re.sub(r"_test$", "", name)
+        name_parts = name.lower().split("_")
+
+        for mod in source_modules:
+            mod_leaf = mod.rsplit(".", 1)[-1].lower()
+            if mod_leaf in name_parts:
+                return mod
+            mod_flat = mod.lower().replace(".", "_")
+            if mod_flat == name.lower():
+                return mod
+
+        return None
+
+    def _collect_existing_tests(
+        self,
+    ) -> Tuple[Dict[str, List[Path]], List[Path]]:
+        """Find test files that ship with the project and link them to modules.
+
+        Returns ``(matched, unmatched)`` where:
+        - *matched* maps ``module_name -> [test_file, ...]``
+        - *unmatched* is a list of test files that couldn't be linked
+        """
+        project = Path(self.project_path).resolve()
+        output = Path(self.output_dir).resolve()
+
+        candidates: List[Path] = []
+        search_roots = [project]
+        for name in ("tests", "test"):
+            d = project / name
+            if d.is_dir():
+                search_roots.append(d)
+
+        for root in search_roots:
+            for pat in ("test_*.py", "*_test.py"):
+                for f in root.rglob(pat):
+                    try:
+                        if f.resolve().is_relative_to(output):
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                    candidates.append(f)
+
+        candidates = sorted(set(candidates))
+
+        source_modules = discover_modules(project)
+
+        matched: Dict[str, List[Path]] = {}
+        unmatched: List[Path] = []
+
+        for tf in candidates:
+            mod = self._match_test_to_module(tf, source_modules)
+            if mod:
+                matched.setdefault(mod, []).append(tf)
+            else:
+                unmatched.append(tf)
+
+        return matched, unmatched
+
+    def _stash_existing_tests(
+        self,
+    ) -> Optional[Tuple[Path, Dict[str, List[str]], List[str]]]:
+        """Copy pre-existing project tests to a temp dir so they survive cleanup.
+
+        Returns ``(stash_dir, matched_map, unmatched_names)`` or None.
+        The *matched_map* maps ``module_name -> [stashed_filename, ...]``.
+        """
+        matched, unmatched = self._collect_existing_tests()
+        all_files = [f for files in matched.values() for f in files] + unmatched
+        if not all_files:
+            return None
+
+        stash = Path(tempfile.mkdtemp(prefix="pyqu_existing_tests_"))
+        used_names: set = set()
+
+        def _safe_copy(src: Path) -> str:
+            dest_name = src.name
+            if dest_name in used_names:
+                dest_name = f"{src.stem}_dup{src.suffix}"
+            used_names.add(dest_name)
+            shutil.copy2(src, stash / dest_name)
+            return dest_name
+
+        stashed_matched: Dict[str, List[str]] = {}
+        for mod, files in matched.items():
+            stashed_matched[mod] = [_safe_copy(f) for f in files]
+
+        stashed_unmatched: List[str] = [_safe_copy(f) for f in unmatched]
+
+        # ── Print discovery report ──
+        print(f"\n[existing-tests] Found {len(all_files)} pre-existing test file(s):")
+        if stashed_matched:
+            for mod, names in sorted(stashed_matched.items()):
+                for n in names:
+                    print(f"  LINKED   {n}  ->  {mod}")
+        if stashed_unmatched:
+            for n in stashed_unmatched:
+                print(f"  UNLINKED {n}  (no matching source module found)")
+
+        return stash, stashed_matched, stashed_unmatched
+
+    def _restore_existing_tests(
+        self,
+        stash_info: Optional[Tuple[Path, Dict[str, List[str]], List[str]]],
+    ) -> None:
+        """Copy stashed tests into the output dir with an ``existing_`` prefix.
+
+        Also writes a small mapping file so ``run_pytest`` can report linkage.
+        """
+        if stash_info is None:
+            return
+
+        stash, matched_map, unmatched_names = stash_info
+        if not stash.exists():
+            return
+
+        output = Path(self.output_dir).resolve()
+        output.mkdir(parents=True, exist_ok=True)
+
+        restored = 0
+        mapping_lines: List[str] = []
+
+        for mod, names in sorted(matched_map.items()):
+            for name in names:
+                src = stash / name
+                dest = output / f"existing_{name}"
+                if src.is_file() and not dest.exists():
+                    shutil.copy2(src, dest)
+                    mapping_lines.append(f"existing_{name}={mod}")
+                    restored += 1
+
+        for name in unmatched_names:
+            src = stash / name
+            dest = output / f"existing_{name}"
+            if src.is_file() and not dest.exists():
+                shutil.copy2(src, dest)
+                mapping_lines.append(f"existing_{name}=UNLINKED")
+                restored += 1
+
+        if mapping_lines:
+            (output / ".existing_test_map").write_text(
+                "\n".join(mapping_lines) + "\n", encoding="utf-8",
+            )
+
+        shutil.rmtree(stash, ignore_errors=True)
+
+        if restored:
+            print(f"[existing-tests] Restored {restored} pre-existing test(s) "
+                  f"into {output} (prefixed with 'existing_')")
 
     # ── Cleanup ──────────────────────────────────────────────────────────
 
@@ -527,6 +799,7 @@ class PynguinRunner:
 
     def run_all(self, *, force_venv: bool = False, all_modules: bool = False) -> bool:
         """Run every stage and return True if the testing phase passed."""
+        existing_stash = self._stash_existing_tests()
         self._cleanup_temp_files()
         self.create_venv(force=force_venv)
         self.install_dependencies()
@@ -547,6 +820,7 @@ class PynguinRunner:
         self._postprocess_tests()
         self._mirror_before_tests_for_after()
         self.generate_hypothesis_tests()
+        self._restore_existing_tests(existing_stash)
         self.run_pytest()
         passed = self.run_comparison()
         return passed
