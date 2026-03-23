@@ -7,7 +7,7 @@ import textwrap
 from pathlib import Path
 from typing import List, Optional
 
-from .config import (
+from config import (
     DEFAULT_ALGORITHM,
     DEFAULT_EXPORT_STRATEGY,
     DEFAULT_OUTPUT_DIR,
@@ -15,7 +15,7 @@ from .config import (
     DEFAULT_SEARCH_TIME,
     VENV_DIR,
 )
-from .runner import PynguinRunner
+from runner import PynguinRunner
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -112,6 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete and recreate the virtual environment from scratch",
     )
+    parser.add_argument(
+        "--force-deps",
+        action="store_true",
+        help="Force reinstall all dependencies even if already installed",
+    )
 
     return parser
 
@@ -156,7 +161,11 @@ def main(argv: Optional[List[str]] = None) -> bool:
         print(f"  Config file    : {Path(runner.config_file).resolve()}")
     print("=" * 60)
 
-    passed = runner.run_all(force_venv=args.force_venv, all_modules=all_modules)
+    passed = runner.run_all(
+        force_venv=args.force_venv,
+        force_deps=args.force_deps,
+        all_modules=all_modules,
+    )
 
     print("\n" + "=" * 60)
     if passed:

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from .helpers import run
+from helpers import run
 
 
 # ── Data structures ──────────────────────────────────────────────────────────

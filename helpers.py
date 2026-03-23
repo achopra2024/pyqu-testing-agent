@@ -43,12 +43,21 @@ def run(
     cwd: Optional[str] = None,
     env: Optional[dict] = None,
     check: bool = True,
+    capture: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Run a subprocess, streaming output in real-time."""
-    print(f"\n{'-' * 60}")
-    print(f"  >> {' '.join(str(c) for c in cmd)}")
-    print(f"{'-' * 60}\n")
-    result = subprocess.run(cmd, cwd=cwd, env=env, text=True)
+    """Run a subprocess, streaming output in real-time.
+
+    When *capture* is True, stdout/stderr are captured and returned on
+    the CompletedProcess object instead of being streamed to the console.
+    """
+    if not capture:
+        print(f"\n{'-' * 60}")
+        print(f"  >> {' '.join(str(c) for c in cmd)}")
+        print(f"{'-' * 60}\n")
+    result = subprocess.run(
+        cmd, cwd=cwd, env=env, text=True,
+        capture_output=capture,
+    )
     if check and result.returncode != 0:
         raise RuntimeError(
             f"Command failed (exit {result.returncode}): {' '.join(str(c) for c in cmd)}"

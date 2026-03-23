@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .config import (
+from config import (
     DEFAULT_ALGORITHM,
     DEFAULT_EXPORT_STRATEGY,
     DEFAULT_OUTPUT_DIR,
@@ -23,8 +23,8 @@ from .config import (
     PYNGUIN_PACKAGE,
     VENV_DIR,
 )
-from .discovery import discover_modules, find_before_after_pairs
-from .helpers import (
+from discovery import discover_modules, find_before_after_pairs
+from helpers import (
     find_dependency_sources,
     is_windows,
     run,
@@ -32,9 +32,9 @@ from .helpers import (
     venv_pip,
     venv_python,
 )
-from .comparator import run_all_comparisons
-from .hypothesis_gen import analyze_params_for_hypothesis, generate_hypothesis_file
-from .preprocessor import (
+from comparator import run_all_comparisons
+from hypothesis_gen import analyze_params_for_hypothesis, generate_hypothesis_file
+from preprocessor import (
     STUB_PREFIX,
     clear_stub_defaults,
     postprocess_test_file,
@@ -87,7 +87,50 @@ class PynguinRunner:
 
     # ── Stage 2: Install dependencies ────────────────────────────────────
 
+    def _deps_fingerprint(self) -> str:
+        """Build a fingerprint string from the project path and requirements source.
+
+        If the fingerprint matches what was stored during the last install,
+        we can safely skip re-installing.
+        """
+        import hashlib
+
+        project = Path(self.project_path).resolve()
+        parts = [str(project), PYNGUIN_PACKAGE, HYPOTHESIS_PACKAGE]
+
+        if self.requirements_file:
+            req_path = Path(self.requirements_file).resolve()
+            if req_path.is_file():
+                parts.append(req_path.read_text(encoding="utf-8", errors="ignore"))
+        else:
+            sources = find_dependency_sources(project)
+            for rf in sources["req_files"]:
+                if rf.is_file():
+                    parts.append(rf.read_text(encoding="utf-8", errors="ignore"))
+            for manifest in (sources["setup_py"], sources["pyproject"], sources["setup_cfg"]):
+                if manifest and manifest.is_file():
+                    parts.append(manifest.read_text(encoding="utf-8", errors="ignore"))
+
+        return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+    def _deps_already_installed(self) -> bool:
+        """Return True if deps were already installed for the same project/requirements."""
+        marker = self._venv_path / ".pyqu_deps_installed"
+        if not marker.is_file():
+            return False
+        stored = marker.read_text(encoding="utf-8").strip()
+        return stored == self._deps_fingerprint()
+
+    def _mark_deps_installed(self) -> None:
+        """Write a marker so the next run can skip dependency installation."""
+        marker = self._venv_path / ".pyqu_deps_installed"
+        marker.write_text(self._deps_fingerprint(), encoding="utf-8")
+
     def install_dependencies(self) -> None:
+        if self._deps_already_installed():
+            print("[deps] Dependencies already installed (unchanged project/requirements). Skipping.")
+            return
+
         project = Path(self.project_path).resolve()
         installed = False
 
@@ -134,6 +177,9 @@ class PynguinRunner:
         )
         print("[deps] hypothesis installed.")
 
+        self._verify_imports(project)
+        self._mark_deps_installed()
+
     # ── Stage 2b: pipreqs fallback ───────────────────────────────────────
 
     def _install_via_pipreqs(self, project: Path) -> None:
@@ -177,7 +223,107 @@ class PynguinRunner:
             if tmp_req.is_file():
                 tmp_req.unlink()
 
-    # ── Stage 2c: ensure __init__.py files exist ─────────────────────────
+    # ── Stage 2c: verify imports and install missing deps ──────────────
+
+    # Common import-name -> PyPI-package mappings that pip/pipreqs miss
+    _IMPORT_TO_PACKAGE = {
+        "cv2": "opencv-python",
+        "sklearn": "scikit-learn",
+        "skimage": "scikit-image",
+        "PIL": "Pillow",
+        "yaml": "PyYAML",
+        "attr": "attrs",
+        "bs4": "beautifulsoup4",
+        "dateutil": "python-dateutil",
+        "gi": "PyGObject",
+        "wx": "wxPython",
+        "Crypto": "pycryptodome",
+        "serial": "pyserial",
+        "usb": "pyusb",
+        "dotenv": "python-dotenv",
+    }
+
+    def _verify_imports(self, project: Path) -> None:
+        """Try importing every project dependency; chase and install missing modules.
+
+        Instead of just checking whether the import name is installed, this
+        actually runs ``import X`` in the venv Python and parses stderr for
+        ``ModuleNotFoundError`` — catching *transitive* missing deps like
+        cv2 (needed by tensorlayer but not by the project directly).
+        """
+        imports: set = set()
+        for py_file in project.rglob("*.py"):
+            try:
+                source = py_file.read_text(encoding="utf-8", errors="ignore")
+                tree = ast.parse(source)
+            except (SyntaxError, OSError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports.add(alias.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imports.add(node.module.split(".")[0])
+
+        local_packages = {p.stem for p in project.iterdir() if p.is_dir() or p.suffix == ".py"}
+        skip = local_packages | {"before", "after"}
+
+        third_party = sorted(imports - skip)
+        if not third_party:
+            return
+
+        print(f"[deps] Verifying {len(third_party)} import(s) can load in the venv ...")
+        max_rounds = 5
+        for round_num in range(1, max_rounds + 1):
+            newly_installed: List[str] = []
+
+            for imp in list(third_party):
+                result = run(
+                    [str(self._python), "-c", f"import {imp}"],
+                    check=False,
+                    capture=True,
+                )
+                if result.returncode == 0:
+                    continue
+
+                stderr = result.stderr or ""
+                missing_mod = self._extract_missing_module(stderr)
+
+                if missing_mod:
+                    pkg = self._IMPORT_TO_PACKAGE.get(missing_mod, missing_mod)
+                    print(f"[deps] Round {round_num}: import '{imp}' failed — "
+                          f"missing '{missing_mod}', installing {pkg} ...")
+                    run(self._pip + ["install", pkg], check=False)
+                    newly_installed.append(pkg)
+                else:
+                    pkg = self._IMPORT_TO_PACKAGE.get(imp, imp)
+                    print(f"[deps] Round {round_num}: import '{imp}' failed, "
+                          f"installing {pkg} ...")
+                    run(self._pip + ["install", pkg], check=False)
+                    newly_installed.append(pkg)
+
+            if not newly_installed:
+                print(f"[deps] All verifiable imports OK.")
+                break
+
+            print(f"[deps] Installed {len(newly_installed)} package(s) in round {round_num}, "
+                  f"re-checking ...")
+        else:
+            print(f"[deps] WARNING: some imports may still fail after {max_rounds} rounds.")
+
+    @staticmethod
+    def _extract_missing_module(output: str) -> Optional[str]:
+        """Parse a ``ModuleNotFoundError`` from any output and return the module name."""
+        for line in reversed(output.strip().splitlines()):
+            m = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]", line)
+            if m:
+                return m.group(1).split(".")[0]
+            m = re.search(r"No module named ['\"]([^'\"]+)['\"]", line)
+            if m:
+                return m.group(1).split(".")[0]
+        return None
+
+    # ── Stage 2d: ensure __init__.py files exist ─────────────────────────
 
     def _ensure_init_files(self, project: Optional[Path] = None) -> None:
         """Create missing ``__init__.py`` files so Pynguin can resolve imports."""
@@ -242,7 +388,7 @@ class PynguinRunner:
 
     # ── Stage 3c: Run Pynguin ────────────────────────────────────────────
 
-    def _build_pynguin_env(self) -> dict:
+    def _build_pynguin_env(self, *extra_paths: str) -> dict:
         env = os.environ.copy()
         env["VIRTUAL_ENV"] = str(self._venv_path)
         env["PYNGUIN_DANGER_AWARE"] = "1"
@@ -250,6 +396,18 @@ class PynguinRunner:
             env["PATH"] = str(self._venv_path / "Scripts") + os.pathsep + env.get("PATH", "")
         else:
             env["PATH"] = str(self._venv_path / "bin") + os.pathsep + env.get("PATH", "")
+
+        project = Path(self.project_path).resolve()
+        paths: List[str] = [str(project), str(project.parent)]
+        for p in extra_paths:
+            resolved = str(Path(p).resolve())
+            if resolved not in paths:
+                paths.append(resolved)
+        existing = env.get("PYTHONPATH", "")
+        if existing:
+            paths.append(existing)
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+
         return env
 
     def run_pynguin(
@@ -294,13 +452,31 @@ class PynguinRunner:
             ]
 
         cmd.extend(self.extra_pynguin_args)
-        env = self._build_pynguin_env()
+        extra = [str(project)] if project_path_override else []
+        env = self._build_pynguin_env(*extra)
 
-        print(f"\n[pynguin] Running Pynguin on module '{target}' ...")
-        result = run(cmd, env=env, check=False)
-        if result.returncode == 0:
-            print(f"[pynguin] Done. Generated tests are in: {output}")
-            return True
+        max_retries = 10
+        for attempt in range(1, max_retries + 1):
+            print(f"\n[pynguin] Running Pynguin on module '{target}' "
+                  f"(attempt {attempt}/{max_retries}) ...")
+            result = run(cmd, env=env, check=False, capture=True)
+
+            combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            print(combined.rstrip())
+
+            if result.returncode == 0:
+                print(f"[pynguin] Done. Generated tests are in: {output}")
+                return True
+
+            missing = self._extract_missing_module(combined)
+            if not missing:
+                break
+
+            pkg = self._IMPORT_TO_PACKAGE.get(missing, missing)
+            print(f"\n[pynguin] Module '{target}' failed due to missing '{missing}'. "
+                  f"Auto-installing {pkg} and retrying ...")
+            run(self._pip + ["install", pkg], check=False)
+
         print(f"[pynguin] WARNING: Pynguin exited with code {result.returncode} for '{target}'")
         return False
 
@@ -468,10 +644,7 @@ class PynguinRunner:
         (i.e. no test that passed in 'before' fails in 'after').
         """
         output = Path(self.output_dir).resolve()
-        project = Path(self.project_path).resolve()
         env = self._build_pynguin_env()
-        env["PYTHONPATH"] = str(project) + os.pathsep + env.get("PYTHONPATH", "")
-
         return run_all_comparisons(output, self._python, env)
 
     # ── Stage 5: Run pytest on test files ────────────────────────────────
@@ -535,9 +708,7 @@ class PynguinRunner:
             print("[pytest] No test files found -- skipping pytest.")
             return False
 
-        project = Path(self.project_path).resolve()
         env = self._build_pynguin_env()
-        env["PYTHONPATH"] = str(project) + os.pathsep + env.get("PYTHONPATH", "")
 
         test_map = self._load_existing_test_map(output)
         all_passed = True
@@ -937,11 +1108,15 @@ class PynguinRunner:
 
     # ── Run all stages ───────────────────────────────────────────────────
 
-    def run_all(self, *, force_venv: bool = False, all_modules: bool = False) -> bool:
+    def run_all(self, *, force_venv: bool = False, force_deps: bool = False, all_modules: bool = False) -> bool:
         """Run every stage and return True if the testing phase passed."""
         existing_stash = self._stash_existing_tests()
         self._cleanup_temp_files()
         self.create_venv(force=force_venv)
+        if force_deps:
+            marker = self._venv_path / ".pyqu_deps_installed"
+            if marker.is_file():
+                marker.unlink()
         self.install_dependencies()
         self._ensure_init_files()
 

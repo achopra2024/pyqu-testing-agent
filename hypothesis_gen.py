@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 from typing import Dict, List, Set
 
-from .preprocessor import _detect_module_imports, _infer_attr_default
+from preprocessor import _detect_module_imports, _infer_attr_default
 
 # ── Strategy mappings ────────────────────────────────────────────────────────
 

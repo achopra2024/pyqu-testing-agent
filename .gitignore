@@ -8,6 +8,11 @@ __pycache__/
 .venv/
 venv/
 env/
+.pynguin_venv/
+
+# Generated outputs
+pynguin_tests/
+pynguin-report/
 
 # Test and tooling caches
 .pytest_cache/

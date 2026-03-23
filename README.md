@@ -26,13 +26,13 @@ The comparison rule is simple:
 From the project root:
 
 ```bash
-python -m pyqu --project-path . --all-modules
+python __main__.py --project-path . --all-modules
 ```
 
 Or target a single module:
 
 ```bash
-python -m pyqu --project-path . --module-name your_package.your_module
+python __main__.py --project-path . --module-name your_package.your_module
 ```
 
 ## Outputs

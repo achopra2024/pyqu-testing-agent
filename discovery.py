@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from .config import DEFAULT_EXCLUDE_DIRS
+from config import DEFAULT_EXCLUDE_DIRS
 
 
 def discover_modules(
