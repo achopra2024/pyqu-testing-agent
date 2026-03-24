@@ -1136,6 +1136,6 @@ class PynguinRunner:
         self._mirror_before_tests_for_after()
         self.generate_hypothesis_tests()
         self._restore_existing_tests(existing_stash)
-        self.run_pytest()
-        passed = self.run_comparison()
-        return passed
+        pytest_passed = self.run_pytest()
+        comparison_passed = self.run_comparison()
+        return pytest_passed and comparison_passed
